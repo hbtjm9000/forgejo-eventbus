@@ -39,17 +39,20 @@ func NewFocalBoard() *FocalBoard {
 }
 
 // Label → FocalBoard Status option ID mapping.
+// These match the board's cardProperties options (e.g., "in-progress", "backlog", "done").
 var fbStatusMap = map[string]string{
-	"in progress": "status-inprogress",
-	"in-progress":  "status-inprogress",
-	"wip":          "status-inprogress",
-	"review":       "status-review",
-	"needs review": "status-review",
-	"in review":    "status-review",
-	"done":         "status-done",
-	"closed":       "status-done",
-	"complete":     "status-done",
-	"backlog":      "status-backlog",
+	"in-progress":  "in-progress",
+	"in progress":  "in-progress",
+	"wip":          "in-progress",
+	"review":       "review",
+	"needs review": "review",
+	"in review":    "review",
+	"done":         "done",
+	"closed":       "done",
+	"complete":     "done",
+	"backlog":      "backlog",
+	"blocked":      "blocked",
+	"cancelled":    "cancelled",
 }
 
 func (fb *FocalBoard) Handle(e events.IssueEvent) error {
@@ -60,9 +63,13 @@ func (fb *FocalBoard) Handle(e events.IssueEvent) error {
 		if err := fb.createCard(e); err != nil {
 			return err
 		}
-		return fb.updateStatus(e.Repository.FullName, e.Issue.Number, "status-done")
-	case "labeled", "unlabeled":
+		return fb.updateStatus(e.Repository.FullName, e.Issue.Number, "done")
+	case "labeled", "unlabeled", "label_updated":
 		label := strings.ToLower(strings.TrimSpace(e.Label.Name))
+		// Some Forgejo events (e.g., PUT /labels) set label.name="" but populate issue.labels
+		if label == "" && len(e.Issue.Labels) > 0 {
+			label = strings.ToLower(strings.TrimSpace(e.Issue.Labels[0].Name))
+		}
 		if statusID, ok := fbStatusMap[label]; ok {
 			return fb.updateStatus(e.Repository.FullName, e.Issue.Number, statusID)
 		}
@@ -104,6 +111,19 @@ func (fb *FocalBoard) createCard(e events.IssueEvent) error {
 
 	payload := map[string]any{"title": title}
 	payloadBytes, _ := json.Marshal(payload)
+
+	// Set initial status from the first label (if any) — POST to /cards expects top-level properties
+	statusID := ""
+	if len(e.Issue.Labels) > 0 {
+		label := strings.ToLower(strings.TrimSpace(e.Issue.Labels[0].Name))
+		if s, ok := fbStatusMap[label]; ok {
+			statusID = s
+		}
+	}
+	if statusID != "" {
+		payload["properties"] = map[string]any{"status": statusID}
+		payloadBytes, _ = json.Marshal(payload)
+	}
 
 	url := fmt.Sprintf("%s/api/v2/boards/%s/cards", fb.URL, fb.Board)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payloadBytes))
@@ -157,16 +177,19 @@ func (fb *FocalBoard) updateStatus(repo string, issueNum int, statusID string) e
 
 	// Search pattern: repo#num: prefix (emoji-stripped)
 	search := fmt.Sprintf("%s#%d:", repo, issueNum)
+	cardTitle := ""
+	cardBoardID := ""
 	var cardID string
 	for _, b := range blocks {
 		if b["type"] != "card" {
 			continue
 		}
-		// Title is at root level; strip emoji chars for reliable matching
 		titleRaw, _ := b["title"].(string)
-		title := strings.TrimLeft(titleRaw, "📋✅📌🔴🟠🟡🟢🔵🟣⚠️🔥✨💡🎯🚀 ") // strip common emoji
+		title := strings.TrimLeft(titleRaw, "📋✅📌🔴🟠🟡🟢🔵🟣⚠️🔥✨💡🎯🚀 ")
 		if strings.Contains(title, search) {
 			cardID, _ = b["id"].(string)
+			cardTitle = titleRaw
+			cardBoardID, _ = b["boardId"].(string)
 			break
 		}
 		// Fallback: check fields.contentOrder[0] (old format)
@@ -175,42 +198,57 @@ func (fb *FocalBoard) updateStatus(repo string, issueNum int, statusID string) e
 			if contentOrder, ok := fields["contentOrder"].([]any); ok && len(contentOrder) > 0 {
 				if t, ok := contentOrder[0].(string); ok && strings.Contains(t, search) {
 					cardID, _ = b["id"].(string)
+					cardTitle = titleRaw
+					cardBoardID, _ = b["boardId"].(string)
 					break
 				}
 			}
 		}
 	}
 
-	if cardID == "" {
-		log.Printf("[focalboard] card not found for %s#%d — skipping status update", repo, issueNum)
-		return nil
-	}
-
-	// Update status via PATCH
-	patchURL := fmt.Sprintf("%s/api/v2/boards/%s/blocks/%s", fb.URL, fb.Board, cardID)
-	patchBody := map[string]any{
-		"fields": map[string]any{
-			"status": statusID,
-		},
-	}
-	patchBytes, _ := json.Marshal(patchBody)
-	patchReq, _ := http.NewRequest(http.MethodPatch, patchURL, bytes.NewReader(patchBytes))
-	patchReq.Header.Set("Authorization", "Bearer "+fb.Token)
-	patchReq.Header.Set("X-Requested-With", "XMLHttpRequest")
-	patchReq.Header.Set("Content-Type", "application/json")
-
-	patchResp, err := fb.client.Do(patchReq)
-	if err != nil {
-		return fmt.Errorf("update status: %w", err)
-	}
-	defer patchResp.Body.Close()
-
-	respBody, _ := io.ReadAll(patchResp.Body)
-	if patchResp.StatusCode >= 400 {
-		log.Printf("[focalboard] update status %d: %s", patchResp.StatusCode, string(respBody))
+	// If card found, delete it first (FocalBoard blocks API uses delete+recreate pattern)
+	if cardID != "" {
+		delURL := fmt.Sprintf("%s/api/v2/boards/%s/blocks/%s", fb.URL, cardBoardID, cardID)
+		delReq, _ := http.NewRequest(http.MethodDelete, delURL, nil)
+		delReq.Header.Set("Authorization", "Bearer "+fb.Token)
+		delReq.Header.Set("X-Requested-With", "XMLHttpRequest")
+		delResp, err := fb.client.Do(delReq)
+		if err != nil {
+			return fmt.Errorf("delete card %s: %w", cardID, err)
+		}
+		delResp.Body.Close()
+		log.Printf("[focalboard] Deleted card %s (will recreate)", cardID)
 	} else {
-		log.Printf("[focalboard] Updated card %s → Status=%s", cardID, statusID)
+		cardTitle = fmt.Sprintf("📋 %s#%d", repo, issueNum)
+		cardBoardID = fb.Board
+		log.Printf("[focalboard] No existing card for %s#%d — creating new one", repo, issueNum)
 	}
+
+	// Re-create card with updated status
+	payload := map[string]any{
+		"title":      cardTitle,
+		"properties": map[string]any{"status": statusID},
+	}
+	payloadBytes, _ := json.Marshal(payload)
+
+	createURL := fmt.Sprintf("%s/api/v2/boards/%s/cards", fb.URL, cardBoardID)
+	crReq, _ := http.NewRequest(http.MethodPost, createURL, bytes.NewReader(payloadBytes))
+	crReq.Header.Set("Authorization", "Bearer "+fb.Token)
+	crReq.Header.Set("X-Requested-With", "XMLHttpRequest")
+	crReq.Header.Set("Content-Type", "application/json")
+
+	crResp, err := fb.client.Do(crReq)
+	if err != nil {
+		return fmt.Errorf("create card: %w", err)
+	}
+	defer crResp.Body.Close()
+
+	crBody, _ := io.ReadAll(crResp.Body)
+	if crResp.StatusCode >= 400 {
+		return fmt.Errorf("create card %d: %s", crResp.StatusCode, string(crBody))
+	}
+
+	log.Printf("[focalboard] Updated card %s — Status=%s", cardID, statusID)
 	return nil
 }
 
